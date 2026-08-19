@@ -113,34 +113,81 @@
     autoSendToken(token);
   }
 
+  // The @n8n/chat widget renders inside a Shadow DOM for style isolation, so a
+  // plain document.querySelector can never see its internal elements. This walks
+  // the light DOM and recurses into every shadowRoot it finds.
+  function deepQueryAll(selector, root = document) {
+    let results = Array.from(root.querySelectorAll(selector));
+    root.querySelectorAll('*').forEach((el) => {
+      if (el.shadowRoot) {
+        results = results.concat(deepQueryAll(selector, el.shadowRoot));
+      }
+    });
+    return results;
+  }
+
+  function setNativeValue(el, value) {
+    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) {
+      setter.call(el, value);
+    } else {
+      el.value = value;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
   function autoSendToken(tokenValue) {
     const start = Date.now();
-    const TIMEOUT_MS = 8000;
+    const TIMEOUT_MS = 15000;
 
     const tryFind = setInterval(() => {
-      const textarea = document.querySelector('#n8n-chat textarea');
-      const sendButton = document.querySelector('#n8n-chat button[type="submit"], #n8n-chat [data-test-id="chat-input-send-button"]');
+      const candidates = deepQueryAll('textarea, input[type="text"], [contenteditable="true"]');
+      const input = candidates.find((el) => el.offsetParent !== null); // visible only
 
-      if (textarea && sendButton) {
+      if (input) {
         clearInterval(tryFind);
 
-        // Set the value using the native setter so the widget's framework
-        // (Vue) picks up the change.
-        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-        nativeSetter.call(textarea, tokenValue);
-        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        if (input.isContentEditable) {
+          input.focus();
+          input.textContent = tokenValue;
+          input.dispatchEvent(new InputEvent('input', { bubbles: true, data: tokenValue }));
+        } else {
+          input.focus();
+          setNativeValue(input, tokenValue);
+        }
 
         setTimeout(() => {
-          sendButton.click();
+          // Try Enter keypress first — most chat inputs submit on Enter.
+          ['keydown', 'keypress', 'keyup'].forEach((type) => {
+            input.dispatchEvent(new KeyboardEvent(type, {
+              key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+            }));
+          });
+
+          // Fallback: also try clicking a nearby send button, in case Enter
+          // alone doesn't trigger submission.
+          setTimeout(() => {
+            const buttons = deepQueryAll('button, [role="button"]');
+            const sendBtn = buttons.find((b) =>
+              b.offsetParent !== null &&
+              (b.type === 'submit' ||
+               /send/i.test(b.getAttribute('aria-label') || '') ||
+               /send/i.test(b.getAttribute('data-test-id') || ''))
+            );
+            if (sendBtn) sendBtn.click();
+          }, 300);
+
           banner.textContent = 'Authenticated. Loading your first question…';
           setTimeout(() => { banner.style.opacity = '0'; }, 2500);
-        }, 200);
+        }, 300);
       } else if (Date.now() - start > TIMEOUT_MS) {
         clearInterval(tryFind);
         banner.textContent = 'Could not auto-authenticate. Please type your token below to continue.';
         banner.classList.add('error');
       }
-    }, 200);
+    }, 300);
   }
 </script>
 

@@ -103,13 +103,17 @@
       mode: 'fullscreen',
       showWelcomeScreen: false,
       initialMessages: [],
+      i18n: {
+        en: {
+          title: '',
+          subtitle: '',
+          footer: '',
+          getStarted: 'Start',
+          inputPlaceholder: 'Type your answer..',
+        },
+      },
     });
 
-    // The official @n8n/chat widget has no documented API to send a message
-    // programmatically without the candidate typing it, so we drive its own
-    // input + send button via the DOM once the widget has mounted. The token
-    // still appears as one auto-sent message bubble (the widget always renders
-    // whatever is sent) — but the candidate never types or pastes anything.
     autoSendToken(token);
   }
 

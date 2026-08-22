@@ -122,22 +122,87 @@ tailwind.config = {
     timerInterval: null,
     timeLeft: 30,
     selectedOption: null,
-    currentQuestion: null // { questionNumber, totalQuestions, questionText, options }
+    currentQuestion: null, // { questionNumber, totalQuestions, questionText, options }
+    monitoringActive: false, // true only while the candidate is actively on a Question screen
+    misconductTriggered: false,
+    fullscreenEnforced: false // true once fullscreen was successfully entered at least once
   };
 
   // ---------------------------------------------------------------------
   // BACKEND CALL
   // ---------------------------------------------------------------------
-  function callBackend(message) {
+  function callBackend(message, extra) {
+    var payload = { sessionId: sessionId, token: token, message: message };
+    if (extra) {
+      for (var k in extra) { if (extra.hasOwnProperty(k)) payload[k] = extra[k]; }
+    }
     return fetch(WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId: sessionId, token: token, message: message })
+      body: JSON.stringify(payload)
     }).then(function (res) {
       if (!res.ok) throw new Error("Request failed with status " + res.status);
       return res.json();
     });
   }
+
+  // ---------------------------------------------------------------------
+  // PROCTORING: best-effort misconduct detection.
+  // Tab-switch and fullscreen-exit are reliable browser signals. PrintScreen
+  // keydown detection is best-effort only - it cannot catch macOS shortcuts,
+  // phone screenshots, or a photo taken of the screen with another device.
+  // ---------------------------------------------------------------------
+  function enterFullscreen() {
+    var el = document.documentElement;
+    var req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+    if (!req) return;
+    try {
+      var result = req.call(el);
+      if (result && result.then) {
+        result.then(function () { state.fullscreenEnforced = true; }).catch(function () {});
+      } else {
+        state.fullscreenEnforced = true;
+      }
+    } catch (e) {}
+  }
+
+  function exitFullscreenIfNeeded() {
+    if (document.fullscreenElement && document.exitFullscreen) {
+      document.exitFullscreen().catch(function () {});
+    }
+  }
+
+  function triggerMisconduct(reason) {
+    if (state.misconductTriggered || !state.monitoringActive) return;
+    state.misconductTriggered = true;
+    state.monitoringActive = false;
+    clearInterval(state.timerInterval);
+    disableQuestionInputs();
+    exitFullscreenIfNeeded();
+    callBackend("MISCONDUCT", { misconduct: true, misconductReason: reason })
+      .then(handleBackendResponse)
+      .catch(function () {
+        // Even if the report couldn't reach the backend, still lock the
+        // session client-side so the candidate can't keep going.
+        viewTerminated("Your assessment has been terminated due to a detected policy violation.");
+      });
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) triggerMisconduct("tab_switch");
+  });
+
+  document.addEventListener("fullscreenchange", function () {
+    if (state.fullscreenEnforced && !document.fullscreenElement) {
+      triggerMisconduct("fullscreen_exit");
+    }
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "PrintScreen") {
+      triggerMisconduct("screenshot_attempt");
+    }
+  });
 
   // ---------------------------------------------------------------------
   // PARSE the relayed question text into structured data.
@@ -268,6 +333,14 @@ tailwind.config = {
         instructionRow("rule", "primary", "Answer format", "Select the option that best answers the question, then click Save (or Submit on the final question).") +
         instructionRow("view_carousel", "primary", "Sequential flow", "Questions are presented one at a time. You cannot go back to previous questions.") +
       '</div>' +
+      '<div class="bg-tertiary-container/10 border border-tertiary/30 rounded-lg p-4 mb-8 flex items-start gap-3">' +
+        '<span class="material-symbols-outlined text-tertiary flex-shrink-0" style="font-variation-settings: \'FILL\' 1;">gpp_maybe</span>' +
+        '<p class="font-body-md text-body-md text-on-surface-variant">' +
+          '<strong class="text-on-surface">This assessment is proctored.</strong> The test will run in fullscreen. ' +
+          'Switching tabs or applications, exiting fullscreen, or attempting to take a screenshot will end your ' +
+          'assessment immediately and be recorded as misconduct.' +
+        '</p>' +
+      '</div>' +
       '<div class="flex justify-center mt-8 pt-8 border-t border-outline-variant">' +
         '<button id="proceed-btn" class="bg-primary hover:bg-[#005a26] text-on-primary font-label-md text-label-md py-3 px-8 rounded-full transition-colors duration-200 flex items-center gap-2 shadow-sm">' +
           'Proceed <span class="material-symbols-outlined text-sm">arrow_forward</span>' +
@@ -275,6 +348,8 @@ tailwind.config = {
       '</div>';
     root.appendChild(wrap);
     document.getElementById("proceed-btn").addEventListener("click", function () {
+      enterFullscreen();
+      state.monitoringActive = true;
       showQuestion(firstQuestion);
     });
   }
@@ -469,6 +544,7 @@ tailwind.config = {
     var output = (data && data.output) || "";
 
     if (data && data.error) {
+      state.monitoringActive = false;
       viewInfo({
         icon: "error",
         iconColorClasses: "bg-tertiary/10 text-tertiary",
@@ -488,7 +564,14 @@ tailwind.config = {
       return;
     }
 
+    if (data && data.misconduct) {
+      state.monitoringActive = false;
+      viewTerminated(output || "Your assessment has been terminated due to a detected policy violation.", data.closeAfterSeconds || 10);
+      return;
+    }
+
     if (data && data.isFinal) {
+      state.monitoringActive = false;
       viewClosing(output || "Your assessment has been submitted.", data.closeAfterSeconds || 10);
       return;
     }
@@ -513,8 +596,45 @@ tailwind.config = {
       // First-ever question for this candidate: show Instructions first.
       viewInstructions(parsed);
     } else {
+      // Covers both normal question-advance AND a candidate resuming
+      // mid-assessment directly on a later question (page reload) - make
+      // sure fullscreen/monitoring is armed either way.
+      if (!state.monitoringActive) {
+        enterFullscreen();
+        state.monitoringActive = true;
+      }
       showQuestion(parsed);
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // VIEW: Terminated (misconduct)
+  // ---------------------------------------------------------------------
+  function viewTerminated(message, closeAfterSeconds) {
+    clear();
+    var wrap = document.createElement("div");
+    wrap.className = "bg-surface-container-lowest border border-outline-variant rounded-xl shadow-[0px_4px_12px_rgba(0,0,0,0.03)] max-w-[540px] w-full p-10 flex flex-col items-center text-center relative overflow-hidden fade-in";
+    wrap.innerHTML =
+      '<div class="absolute top-0 left-0 right-0 h-1 bg-tertiary"></div>' +
+      iconCircle("gpp_bad", "bg-tertiary/10 text-tertiary") +
+      '<h1 class="font-headline-lg text-headline-lg text-on-surface mb-4">Assessment terminated</h1>' +
+      '<p class="font-body-lg text-body-lg text-on-surface-variant mb-12 max-w-[400px]">' + escapeHtml(message) + '</p>' +
+      '<div class="mt-4 pt-6 border-t border-surface-variant w-full">' +
+        '<p class="font-caption text-caption text-on-surface-variant opacity-70" id="countdown-text">Closing in <span id="countdown-timer">' + (closeAfterSeconds || 10) + '</span>s</p>' +
+      '</div>';
+    root.appendChild(wrap);
+
+    var timeLeft = closeAfterSeconds || 10;
+    var timerEl = document.getElementById("countdown-timer");
+    var textEl = document.getElementById("countdown-text");
+    var interval = setInterval(function () {
+      timeLeft -= 1;
+      if (timerEl) timerEl.textContent = timeLeft;
+      if (timeLeft <= 0) {
+        clearInterval(interval);
+        if (textEl) textEl.textContent = "This window can now be closed.";
+      }
+    }, 1000);
   }
 
   // ---------------------------------------------------------------------
